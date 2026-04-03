@@ -5,11 +5,11 @@ import { jsPDF } from 'jspdf';
 import './index.css';
 
 // --- CONFIGURAZIONE CLOUD RUN / DRIVE API ---
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "459844148501-q51mjbjk1kqj4ku90c7tooh51lcgbs3f.apps.googleusercontent.com"; 
-const GOOGLE_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY || "AIzaSyCI-zsRP85UVOi0DjtiCwWBwQ1djDy741g"; 
-const ROOT_FOLDER_ID = import.meta.env.VITE_ROOT_FOLDER_ID || "1aY3zA-D3_tAhEFLmasuTCz3JURKeviKP"; 
-const SENT_FOLDER_ID = import.meta.env.VITE_SENT_FOLDER_ID || "16_ie96ihd4lJouI8BcrqjjfQS_Rq7Ep0"; 
-const DB_FOLDER_ID = import.meta.env.VITE_DB_FOLDER_ID || "13L8CT9j-_Y-_sT6Xp6CEqQ52E0eZaB_Y"; 
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || ""; 
+const GOOGLE_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY || ""; 
+const ROOT_FOLDER_ID = import.meta.env.VITE_ROOT_FOLDER_ID || ""; 
+let SENT_FOLDER_ID = import.meta.env.VITE_SENT_FOLDER_ID || ""; 
+const DB_FOLDER_ID = import.meta.env.VITE_DB_FOLDER_ID || ""; 
 const DB_FILE_NAME = "successio_master_db.json";
 
 const GRADI_PARENTELA = [
@@ -34,7 +34,9 @@ const GRADI_PARENTELA = [
 const TIPOLOGIE_PRATICA = [
     "Successione",
     "Voltura",
-    "Consulenza",
+    "Locazione",
+    "Comodato d'uso",
+    "Curriculum Vitae",
     "Altro"
 ];
 
@@ -135,6 +137,14 @@ const DriveAPI = {
         const response = await fetch(url, { method: 'PATCH', headers: { 'Authorization': `Bearer ${token}` } });
         return response.ok;
     },
+    getFile: async (token: string, fileId: string) => {
+        const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,parents,mimeType`, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!response.ok) throw new Error('Errore recupero info file Drive');
+        return await response.json();
+    },
     listFolders: async (token: string, parentId: string) => {
         const q = `'${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
         const response = await fetch(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id, name, createdTime, description)&orderBy=createdTime desc&pageSize=1000`, {
@@ -153,7 +163,7 @@ const GAS = {
   isAvailable: () => typeof window !== 'undefined' && (window as any).google && (window as any).google.script,
   
   syncToDrive: async () => {
-    if (!GAS.token) return;
+    if (!GAS.token || !IS_DB_LOADED) return;
     try {
         const content = {
             folders: MOCK_FOLDERS,
@@ -166,6 +176,18 @@ const GAS = {
 
   loadFromDrive: async (force = false) => {
     if (!GAS.token) return null;
+    
+    // Cerca o crea la cartella "Inviate" se non è stata ancora trovata
+    try {
+        const folders = await DriveAPI.listFolders(GAS.token, ROOT_FOLDER_ID);
+        const sentFolder = folders.find((f: any) => f.name.toLowerCase() === 'inviate');
+        if (sentFolder) {
+            SENT_FOLDER_ID = sentFolder.id;
+        } else {
+            SENT_FOLDER_ID = await DriveAPI.createFolder(GAS.token, 'Inviate', ROOT_FOLDER_ID);
+        }
+    } catch (e) { console.error("Errore ricerca cartella Inviate:", e); }
+
     if (IS_DB_LOADED && !force) return { folders: MOCK_FOLDERS, details: MOCK_DETAILS, eco: MOCK_ECO };
     try {
         const fileId = await DriveAPI.searchFile(GAS.token, DB_FILE_NAME, DB_FOLDER_ID);
@@ -182,8 +204,15 @@ const GAS = {
                 IS_DB_LOADED = true;
                 return data;
             }
+        } else {
+            // Il file non esiste ancora, ma abbiamo controllato.
+            // Possiamo considerare il DB caricato (come vuoto).
+            IS_DB_LOADED = true;
         }
-    } catch (e) { console.error("Errore caricamento DB Drive:", e); }
+    } catch (e) { 
+        console.error("Errore caricamento DB Drive:", e); 
+        // Non impostiamo IS_DB_LOADED = true qui per permettere riprovi
+    }
     return null;
   },
 
@@ -194,34 +223,41 @@ const GAS = {
       });
     }
 
-    if (GAS.token && fname === 'creaCartella') {
-        const name = args[0];
-        const erediList = args[1] || [];
-        try {
-            const id = await DriveAPI.createFolder(GAS.token, name, ROOT_FOLDER_ID);
-            await DriveAPI.createFolder(GAS.token, "Documenti", id);
-            await DriveAPI.createFolder(GAS.token, "Ricevute", id);
-            MOCK_FOLDERS.unshift({ id: id, name: name, type: 'Successione', created: new Date().toLocaleDateString(), status: 'APERTA', fee: 0, paid: 0, lastUpdate: new Date().toLocaleDateString() });
-            MOCK_DETAILS[id] = { 
-                status: 'APERTA', 
-                type: 'Successione',
-                fee: '', 
-                eredi: erediList,
-                history: [{date: new Date().toLocaleString(), type:'status', user:'Sistema', text:'Pratica Creata su Drive'}] 
-            };
-            await GAS.syncToDrive();
-            return id;
-        } catch (e) { console.error(e); throw e; }
+    if (GAS.token) {
+        // Assicura che il database sia caricato prima di qualsiasi operazione
+        if (!IS_DB_LOADED && fname !== 'loadFromDrive') {
+            await GAS.loadFromDrive();
+        }
     }
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         setTimeout(async () => {
-          if (fname === 'getExistingSuccessionFolders') {
+          try {
+            if (fname === 'getExistingSuccessionFolders') {
              await GAS.loadFromDrive();
              if (GAS.token) {
                  try {
-                     const activeFiles = await DriveAPI.listFolders(GAS.token, ROOT_FOLDER_ID);
-                     const sentFiles = await DriveAPI.listFolders(GAS.token, SENT_FOLDER_ID);
+                     const typeFolderNames = ['successioni', 'Volture', 'Locazioni', 'Comodati', 'Curriculum', 'Altro'];
+                     const rootFolders = await DriveAPI.listFolders(GAS.token, ROOT_FOLDER_ID);
+                     
+                     let activeFiles: any[] = [];
+                     const typeSubfolders = rootFolders.filter((f: any) => typeFolderNames.map(n=>n.toLowerCase()).includes(f.name.toLowerCase()));
+                     const legacyFolders = rootFolders.filter((f: any) => !typeFolderNames.map(n=>n.toLowerCase()).includes(f.name.toLowerCase()));
+                     
+                     activeFiles = [...legacyFolders];
+                     for (const sub of typeSubfolders) {
+                         const subContents = await DriveAPI.listFolders(GAS.token, sub.id);
+                         for (const folder of subContents) {
+                             if (folder.name.toLowerCase() === 'da inviare' || folder.name.toLowerCase() === 'inviati') {
+                                 const practiceFolders = await DriveAPI.listFolders(GAS.token, folder.id);
+                                 activeFiles = [...activeFiles, ...practiceFolders];
+                             } else {
+                                 // Supporto per cartelle messe direttamente nella tipologia
+                                 activeFiles.push(folder);
+                             }
+                         }
+                     }
+
                      const mapDriveFolder = (f: any) => {
                          const existingMock = MOCK_FOLDERS.find(m => m.id === f.id);
                          let displayDate = f.createdTime ? new Date(f.createdTime).toLocaleDateString() : new Date().toLocaleDateString();
@@ -235,9 +271,8 @@ const GAS = {
                              lastUpdate: f.createdTime ? new Date(f.createdTime).toLocaleDateString() : new Date().toLocaleDateString()
                          };
                      };
-                     const activeList = activeFiles.map((f: any) => mapDriveFolder(f));
-                     const sentList = sentFiles.map((f: any) => mapDriveFolder(f));
-                     const allDriveFolders = [...activeList, ...sentList].sort((a,b) => b.id.localeCompare(a.id));
+                     const allList = activeFiles.map((f: any) => mapDriveFolder(f));
+                     const allDriveFolders = allList.sort((a,b) => b.id.localeCompare(a.id));
                      MOCK_FOLDERS = allDriveFolders;
                      resolve(allDriveFolders);
                      return;
@@ -282,8 +317,38 @@ const GAS = {
              const normalized = normalizeStatus(status);
              if (GAS.token) {
                  try {
-                     if (normalized === 'INVIATA') await DriveAPI.moveFile(GAS.token, id, ROOT_FOLDER_ID, SENT_FOLDER_ID);
-                     else await DriveAPI.moveFile(GAS.token, id, SENT_FOLDER_ID, ROOT_FOLDER_ID);
+                     const fileInfo = await DriveAPI.getFile(GAS.token, id);
+                     const currentParentId = fileInfo.parents ? fileInfo.parents[0] : null;
+                     
+                     const det = MOCK_DETAILS[id] || { type: 'Successione' };
+                     const tipo = det.type || 'Successione';
+                     const typeFolders: Record<string, string> = {
+                         'Successione': 'successioni', 'Voltura': 'Volture', 'Locazione': 'Locazioni',
+                         'Comodato d\'uso': 'Comodati', 'Curriculum Vitae': 'Curriculum', 'Altro': 'Altro'
+                     };
+                     const targetSubfolderName = typeFolders[tipo] || 'Altro';
+                     
+                     // Trova la cartella di tipologia
+                     const rootFolders = await DriveAPI.listFolders(GAS.token, ROOT_FOLDER_ID);
+                     let typeSubfolder = rootFolders.find((f: any) => f.name.toLowerCase() === targetSubfolderName.toLowerCase());
+                     if (typeSubfolder) {
+                         const subFolders = await DriveAPI.listFolders(GAS.token, typeSubfolder.id);
+                         let daInviareFolder = subFolders.find((f: any) => f.name.toLowerCase() === 'da inviare');
+                         let inviatiFolder = subFolders.find((f: any) => f.name.toLowerCase() === 'inviati');
+                         
+                         let daInviareId = daInviareFolder ? daInviareFolder.id : await DriveAPI.createFolder(GAS.token, 'da inviare', typeSubfolder.id);
+                         let inviatiId = inviatiFolder ? inviatiFolder.id : await DriveAPI.createFolder(GAS.token, 'inviati', typeSubfolder.id);
+
+                         if (normalized === 'INVIATA') {
+                             if (currentParentId !== inviatiId) {
+                                 await DriveAPI.moveFile(GAS.token, id, currentParentId || daInviareId, inviatiId);
+                             }
+                         } else {
+                             if (currentParentId === inviatiId) {
+                                 await DriveAPI.moveFile(GAS.token, id, inviatiId, daInviareId);
+                             }
+                         }
+                     }
                  } catch (e) { console.error("Errore spostamento cartella Drive:", e); }
              }
              if (!MOCK_DETAILS[id]) MOCK_DETAILS[id] = { status: normalized, type: 'Successione', fee:'0', history: [] };
@@ -303,21 +368,42 @@ const GAS = {
              await GAS.syncToDrive();
              resolve(true);
           } else if (fname === 'creaCartella') {
-             const newId = Math.random().toString(36).substr(2, 5);
-             const name = args[0];
-             const erediList = args[1] || [];
-              const type = args[2] || 'Successione';
-              MOCK_FOLDERS.unshift({ id: newId, name: name, type: type, created: new Date().toLocaleDateString(), status: 'APERTA', fee: 0, paid: 0, lastUpdate: new Date().toLocaleDateString() });
+             const [name, erediList, type, extraData] = args;
+             const tipo = type || 'Successione';
+             let newId = Math.random().toString(36).substr(2, 5);
+             
+             if (GAS.token) {
+                 try {
+                     const typeFolders: Record<string, string> = {
+                         'Successione': 'successioni', 'Voltura': 'Volture', 'Locazione': 'Locazioni',
+                         'Comodato d\'uso': 'Comodati', 'Curriculum Vitae': 'Curriculum', 'Altro': 'Altro'
+                     };
+                     const targetSubfolderName = typeFolders[tipo] || 'Altro';
+                     const rootFolders = await DriveAPI.listFolders(GAS.token, ROOT_FOLDER_ID);
+                     let typeSubfolder = rootFolders.find((f: any) => f.name.toLowerCase() === targetSubfolderName.toLowerCase());
+                     let typeFolderId = typeSubfolder ? typeSubfolder.id : await DriveAPI.createFolder(GAS.token, targetSubfolderName, ROOT_FOLDER_ID);
+                     const subFolders = await DriveAPI.listFolders(GAS.token, typeFolderId);
+                     let daInviareFolder = subFolders.find((f: any) => f.name.toLowerCase() === 'da inviare');
+                     let daInviareId = daInviareFolder ? daInviareFolder.id : await DriveAPI.createFolder(GAS.token, 'da inviare', typeFolderId);
+                     newId = await DriveAPI.createFolder(GAS.token, name, daInviareId);
+                     await DriveAPI.createFolder(GAS.token, "Documenti", newId);
+                     await DriveAPI.createFolder(GAS.token, "Ricevute", newId);
+                 } catch (e) { console.error("Errore creazione cartella Drive:", e); }
+             }
+
+             MOCK_FOLDERS.unshift({ id: newId, name: name, type: tipo, created: new Date().toLocaleDateString(), status: 'APERTA', fee: 0, paid: 0, lastUpdate: new Date().toLocaleDateString() });
              MOCK_DETAILS[newId] = { 
                 status: 'APERTA', 
-                type: type,
+                type: tipo,
                 fee: '', 
-                eredi: erediList,
-                history: [{date: new Date().toLocaleString(), type:'status', user:'Sistema', text:'Pratica Creata (Locale)'}] 
+                eredi: erediList || [],
+                history: [{date: new Date().toLocaleString(), type:'status', user:'Sistema', text:`Pratica ${tipo} Creata`}],
+                ...extraData
              };
              await GAS.syncToDrive();
              resolve(newId);
           } else { resolve({ success: true }); }
+        } catch (e) { reject(e); }
         }, 300);
     });
   }
@@ -343,6 +429,14 @@ interface PracticeDetails {
     fee?: string;
     history: LogEntry[];
     eredi?: Erede[];
+    secondoNome?: string;
+    secondoIndirizzo?: string;
+    datiCatastali?: string;
+    canone?: string;
+    durata?: string;
+    esperienze?: string;
+    titoliStudio?: string;
+    competenze?: string;
 }
 
 interface DashboardPractice {
@@ -404,6 +498,17 @@ const SuccessioPro = () => {
   const [dichiaranteEmail, setDichiaranteEmail] = useState('');
   const [dichiaranteIndirizzo, setDichiaranteIndirizzo] = useState('');
   const [iban, setIban] = useState('');
+  
+  // Nuovi stati per servizi aggiuntivi
+  const [secondoNome, setSecondoNome] = useState('');
+  const [secondoIndirizzo, setSecondoIndirizzo] = useState('');
+  const [datiCatastali, setDatiCatastali] = useState('');
+  const [canone, setCanone] = useState('');
+  const [durata, setDurata] = useState('');
+  const [esperienze, setEsperienze] = useState('');
+  const [titoliStudio, setTitoliStudio] = useState('');
+  const [competenze, setCompetenze] = useState('');
+
   const [chkErede, setChkErede] = useState(false);
   const [chkUnicoErede, setChkUnicoErede] = useState(false);
   const [eredi, setEredi] = useState<Erede[]>([]);
@@ -702,47 +807,103 @@ const SuccessioPro = () => {
 
     doc.setFontSize(10);
     doc.setFont("helvetica", "normal");
+    doc.text(`Servizio: ${tipoPratica.toUpperCase()}`, margin, y);
+    y += 5;
     doc.text(`Pratica generata il: ${new Date().toLocaleString()}`, margin, y);
     y += 10;
 
     doc.line(margin, y, 210 - margin, y);
     y += 10;
 
-    // Sezione Decuius
-    doc.setFont("helvetica", "bold");
-    doc.text("DATI DECUIUS", margin, y);
-    y += 7;
-    doc.setFont("helvetica", "normal");
-    doc.text(`Nominativo: ${nomeCognome}`, margin, y);
-    y += 5;
-    doc.text(`Residenza: ${indirizzo}`, margin, y);
-    y += 5;
-    doc.text(`Immobili: ${immobiliOption || 'N/D'} | Rapporti Bancari: ${rapportiOption || 'N/D'} | Testamento: ${testamentoOption || 'N/D'}`, margin, y);
-    y += 15;
+    if (tipoPratica === 'Successione' || tipoPratica === 'Voltura' || tipoPratica === 'Altro') {
+       // Sezione Decuius
+       doc.setFont("helvetica", "bold");
+       doc.text("DATI DECUIUS / INTESTATARIO", margin, y);
+       y += 7;
+       doc.setFont("helvetica", "normal");
+       doc.text(`Nominativo: ${nomeCognome}`, margin, y);
+       y += 5;
+       doc.text(`Residenza: ${indirizzo}`, margin, y);
+       y += 5;
+       doc.text(`Immobili: ${immobiliOption || 'N/D'} | Rapporti Bancari: ${rapportiOption || 'N/D'} | Testamento: ${testamentoOption || 'N/D'}`, margin, y);
+       y += 15;
 
-    // Sezione Dichiarante
-    doc.setFont("helvetica", "bold");
-    doc.text("DATI DICHIARANTE / CONTATTO", margin, y);
-    y += 7;
-    doc.setFont("helvetica", "normal");
-    doc.text(`Nominativo: ${dichiaranteNome} (${dichiaranteParentela})`, margin, y);
-    y += 5;
-    doc.text(`Contatti: ${dichiaranteCell} - ${dichiaranteEmail}`, margin, y);
-    y += 5;
-    doc.text(`IBAN per rimborsi: ${iban || 'N/D'}`, margin, y);
-    y += 15;
+       // Sezione Dichiarante
+       doc.setFont("helvetica", "bold");
+       doc.text("DATI DICHIARANTE / CONTATTO", margin, y);
+       y += 7;
+       doc.setFont("helvetica", "normal");
+       doc.text(`Nominativo: ${dichiaranteNome} (${dichiaranteParentela})`, margin, y);
+       y += 5;
+       doc.text(`Contatti: ${dichiaranteCell} - ${dichiaranteEmail}`, margin, y);
+       y += 5;
+       doc.text(`IBAN per rimborsi: ${iban || 'N/D'}`, margin, y);
+       y += 15;
 
-    // Sezione Eredi
-    if (eredi.length > 0) {
-        doc.setFont("helvetica", "bold");
-        doc.text("ALBERO EREDITARIO", margin, y);
-        y += 7;
-        doc.setFont("helvetica", "normal");
-        eredi.forEach((e, idx) => {
-            doc.text(`${idx + 1}. ${e.nome} - Parentela: ${e.parentela}`, margin + 5, y);
-            y += 5;
-        });
-        y += 10;
+       // Sezione Eredi
+       if (eredi.length > 0) {
+           doc.setFont("helvetica", "bold");
+           doc.text("ALBERO EREDITARIO", margin, y);
+           y += 7;
+           doc.setFont("helvetica", "normal");
+           eredi.forEach((e, idx) => {
+               doc.text(`${idx + 1}. ${e.nome} - Parentela: ${e.parentela}`, margin + 5, y);
+               y += 5;
+           });
+           y += 10;
+       }
+    } else if (tipoPratica === 'Locazione' || tipoPratica === 'Comodato d\'uso') {
+       doc.setFont("helvetica", "bold");
+       doc.text("DATI DELLE PARTI", margin, y);
+       y += 7;
+       doc.setFont("helvetica", "normal");
+       doc.text(`${tipoPratica === 'Locazione' ? 'Locatore' : 'Comodante'}: ${nomeCognome} (${indirizzo})`, margin, y);
+       y += 5;
+       doc.text(`${tipoPratica === 'Locazione' ? 'Conduttore' : 'Comodatario'}: ${secondoNome} (${secondoIndirizzo})`, margin, y);
+       y += 15;
+
+       doc.setFont("helvetica", "bold");
+       doc.text("DATI IMMOBILE E CONTRATTO", margin, y);
+       y += 7;
+       doc.setFont("helvetica", "normal");
+       doc.text(`Dati Catastali: ${datiCatastali || 'N/D'}`, margin, y);
+       y += 5;
+       if (tipoPratica === 'Locazione') {
+           doc.text(`Canone Annuo: € ${canone || 'N/D'}`, margin, y);
+           y += 5;
+       }
+       doc.text(`Durata: ${durata || 'N/D'}`, margin, y);
+       y += 15;
+    } else if (tipoPratica === 'Curriculum Vitae') {
+       doc.setFont("helvetica", "bold");
+       doc.text("DATI ANAGRAFICI", margin, y);
+       y += 7;
+       doc.setFont("helvetica", "normal");
+       doc.text(`Nominativo: ${nomeCognome}`, margin, y);
+       y += 5;
+       doc.text(`Indirizzo: ${indirizzo}`, margin, y);
+       y += 5;
+       doc.text(`Contatti: ${dichiaranteCell} - ${dichiaranteEmail}`, margin, y);
+       y += 15;
+
+       doc.setFont("helvetica", "bold");
+       doc.text("ESPERIENZE E ISTRUZIONE", margin, y);
+       y += 7;
+       doc.setFont("helvetica", "normal");
+       const expLines = doc.splitTextToSize(`Esperienze: ${esperienze}`, 180);
+       doc.text(expLines, margin, y);
+       y += expLines.length * 5 + 5;
+       const eduLines = doc.splitTextToSize(`Titoli: ${titoliStudio}`, 180);
+       doc.text(eduLines, margin, y);
+       y += eduLines.length * 5 + 10;
+
+       doc.setFont("helvetica", "bold");
+       doc.text("COMPETENZE", margin, y);
+       y += 7;
+       doc.setFont("helvetica", "normal");
+       const compLines = doc.splitTextToSize(competenze, 180);
+       doc.text(compLines, margin, y);
+       y += compLines.length * 5 + 15;
     }
 
     doc.setFont("helvetica", "italic");
@@ -782,7 +943,22 @@ const SuccessioPro = () => {
     }
 
     try {
-      const folderId = await GAS.run('creaCartella', nomeCognome, eredi.map(e=>({id:e.id, nome:e.nome, parentela:e.parentela})), tipoPratica);
+      const extraData: any = {};
+      if (tipoPratica === 'Locazione' || tipoPratica === 'Comodato d\'uso') {
+          extraData.secondoNome = secondoNome;
+          extraData.secondoIndirizzo = secondoIndirizzo;
+          extraData.datiCatastali = datiCatastali;
+          extraData.canone = canone;
+          extraData.durata = durata;
+      } else if (tipoPratica === 'Curriculum Vitae') {
+          extraData.esperienze = esperienze;
+          extraData.titoliStudio = titoliStudio;
+          extraData.competenze = competenze;
+          extraData.dichiaranteCell = dichiaranteCell;
+          extraData.dichiaranteEmail = dichiaranteEmail;
+      }
+
+      const folderId = await GAS.run('creaCartella', nomeCognome, eredi.map(e=>({id:e.id, nome:e.nome, parentela:e.parentela})), tipoPratica, extraData);
       
       if (GAS.token) {
         // Carica i documenti selezionati
@@ -898,57 +1074,144 @@ const SuccessioPro = () => {
                 {[1,2,3,4].map(i => <span key={i} className={`wizard-step ${step===i?'active':''}`}>{i}</span>)}
              </div>
              <div className={step !== 1 ? 'hidden' : ''}>
-                 <label>Tipologia Pratica:</label>
-                 <select value={tipoPratica} onChange={e=>setTipoPratica(e.target.value)} style={{marginBottom:10}}>
+                 <label>Tipologia Servizio:</label>
+                 <select value={tipoPratica} onChange={e=>setTipoPratica(e.target.value)} style={{marginBottom:15, fontWeight:'bold', fontSize:'1.1em'}}>
                      {TIPOLOGIE_PRATICA.map(t => <option key={t} value={t}>{t}</option>)}
                  </select>
-                 <label>Decuius:</label><input type="text" value={nomeCognome} onChange={e=>setNomeCognome(e.target.value)} placeholder="Nome e Cognome" />
-                 <input type="text" value={indirizzo} onChange={e=>setIndirizzo(e.target.value)} placeholder="Indirizzo residenza" style={{marginTop:8}} />
-                 <div style={{display:'flex', gap:8, marginTop:6}}>
-                    <div style={{flex:1}}><label>Immobili</label><select value={immobiliOption} onChange={e=>setImmobiliOption(e.target.value)}><option value="">--</option><option value="Si">Sì</option><option value="No">No</option></select></div>
-                    <div style={{flex:1}}><label>Rapporti bancari</label><select value={rapportiOption} onChange={e=>setRapportiOption(e.target.value)}><option value="">--</option><option value="Si">Sì</option><option value="No">No</option></select></div>
-                 </div>
-                 <div style={{marginTop:6}}><label>Testamento</label><select value={testamentoOption} onChange={e=>setTestamentoOption(e.target.value)}><option value="">--</option><option value="Si">Sì</option><option value="No">No</option></select></div>
+
+                 {(tipoPratica === 'Successione' || tipoPratica === 'Voltura' || tipoPratica === 'Altro') && (
+                   <div className="animate-in slide-in-from-bottom-2">
+                       <label>Decuius / Intestatario:</label>
+                       <input type="text" value={nomeCognome} onChange={e=>setNomeCognome(e.target.value)} placeholder="Nome e Cognome" />
+                       <input type="text" value={indirizzo} onChange={e=>setIndirizzo(e.target.value)} placeholder="Indirizzo residenza" style={{marginTop:8}} />
+                       <div style={{display:'flex', gap:8, marginTop:6}}>
+                           <div style={{flex:1}}><label>Immobili</label><select value={immobiliOption} onChange={e=>setImmobiliOption(e.target.value)}><option value="">--</option><option value="Si">Sì</option><option value="No">No</option></select></div>
+                           <div style={{flex:1}}><label>Rapporti bancari</label><select value={rapportiOption} onChange={e=>setRapportiOption(e.target.value)}><option value="">--</option><option value="Si">Sì</option><option value="No">No</option></select></div>
+                       </div>
+                       <div style={{marginTop:6}}><label>Testamento</label><select value={testamentoOption} onChange={e=>setTestamentoOption(e.target.value)}><option value="">--</option><option value="Si">Sì</option><option value="No">No</option></select></div>
+                   </div>
+                 )}
+
+                 {(tipoPratica === 'Locazione' || tipoPratica === 'Comodato d\'uso') && (
+                   <div className="animate-in slide-in-from-bottom-2">
+                       <label>{tipoPratica === 'Locazione' ? 'Locatore' : 'Comodante'}:</label>
+                       <input type="text" value={nomeCognome} onChange={e=>setNomeCognome(e.target.value)} placeholder="Nome e Cognome" />
+                       <input type="text" value={indirizzo} onChange={e=>setIndirizzo(e.target.value)} placeholder="Indirizzo" style={{marginTop:8}} />
+                       
+                       <label style={{marginTop:15, display:'block'}}>{tipoPratica === 'Locazione' ? 'Conduttore' : 'Comodatario'}:</label>
+                       <input type="text" value={secondoNome} onChange={e=>setSecondoNome(e.target.value)} placeholder="Nome e Cognome" />
+                       <input type="text" value={secondoIndirizzo} onChange={e=>setSecondoIndirizzo(e.target.value)} placeholder="Indirizzo" style={{marginTop:8}} />
+                   </div>
+                 )}
+
+                 {tipoPratica === 'Curriculum Vitae' && (
+                   <div className="animate-in slide-in-from-bottom-2">
+                       <label>Dati Anagrafici:</label>
+                       <input type="text" value={nomeCognome} onChange={e=>setNomeCognome(e.target.value)} placeholder="Nome e Cognome" />
+                       <input type="text" value={indirizzo} onChange={e=>setIndirizzo(e.target.value)} placeholder="Indirizzo residenza" style={{marginTop:8}} />
+                       <div style={{display:'flex', gap:8, marginTop:8}}>
+                           <input type="tel" value={dichiaranteCell} onChange={e=>setDichiaranteCell(e.target.value)} placeholder="Cellulare" />
+                           <input type="email" value={dichiaranteEmail} onChange={e=>setDichiaranteEmail(e.target.value)} placeholder="Email" />
+                       </div>
+                   </div>
+                 )}
              </div>
              
              <div className={step !== 2 ? 'hidden' : ''}>
-                 <label>Dichiarante:</label>
-                 <select value={dichiaranteParentela} onChange={e=>setDichiaranteParentela(e.target.value)}>
-                     <option value="">Grado parentela...</option>
-                     {GRADI_PARENTELA.map(g => <option key={g} value={g}>{g}</option>)}
-                 </select>
-                 <input type="text" value={dichiaranteNome} onChange={e=>setDichiaranteNome(e.target.value)} placeholder="Nome e Cognome" style={{marginTop:8}} />
-                 <div style={{display:'flex', gap:8, marginTop:8}}><input type="tel" value={dichiaranteCell} onChange={e=>setDichiaranteCell(e.target.value)} placeholder="Cellulare" /><input type="email" value={dichiaranteEmail} onChange={e=>setDichiaranteEmail(e.target.value)} placeholder="Email" /></div>
-                 <input type="text" value={iban} onChange={e=>setIban(e.target.value)} placeholder="IBAN" style={{marginTop:8}} />
+                 {(tipoPratica === 'Successione' || tipoPratica === 'Voltura' || tipoPratica === 'Altro') && (
+                   <div className="animate-in slide-in-from-bottom-2">
+                       <label>Dichiarante:</label>
+                       <select value={dichiaranteParentela} onChange={e=>setDichiaranteParentela(e.target.value)}>
+                           <option value="">Grado parentela...</option>
+                           {GRADI_PARENTELA.map(g => <option key={g} value={g}>{g}</option>)}
+                       </select>
+                       <input type="text" value={dichiaranteNome} onChange={e=>setDichiaranteNome(e.target.value)} placeholder="Nome e Cognome" style={{marginTop:8}} />
+                       <div style={{display:'flex', gap:8, marginTop:8}}><input type="tel" value={dichiaranteCell} onChange={e=>setDichiaranteCell(e.target.value)} placeholder="Cellulare" /><input type="email" value={dichiaranteEmail} onChange={e=>setDichiaranteEmail(e.target.value)} placeholder="Email" /></div>
+                       <input type="text" value={iban} onChange={e=>setIban(e.target.value)} placeholder="IBAN" style={{marginTop:8}} />
+                   </div>
+                 )}
+
+                 {(tipoPratica === 'Locazione' || tipoPratica === 'Comodato d\'uso') && (
+                   <div className="animate-in slide-in-from-bottom-2">
+                       <label>Dati Immobile e Contratto:</label>
+                       <input type="text" value={datiCatastali} onChange={e=>setDatiCatastali(e.target.value)} placeholder="Dati Catastali (Foglio, Particella, Sub)" />
+                       <div style={{display:'flex', gap:8, marginTop:8}}>
+                           {tipoPratica === 'Locazione' && <input type="text" value={canone} onChange={e=>setCanone(e.target.value)} placeholder="Canone Annuo (€)" />}
+                           <input type="text" value={durata} onChange={e=>setDurata(e.target.value)} placeholder="Durata Contratto" />
+                       </div>
+                   </div>
+                 )}
+
+                 {tipoPratica === 'Curriculum Vitae' && (
+                   <div className="animate-in slide-in-from-bottom-2">
+                       <label>Esperienze e Istruzione:</label>
+                       <textarea value={esperienze} onChange={e=>setEsperienze(e.target.value)} placeholder="Esperienze Lavorative (Dettagliate)" style={{height:100, marginBottom:8}} />
+                       <textarea value={titoliStudio} onChange={e=>setTitoliStudio(e.target.value)} placeholder="Titoli di Studio e Formazione" style={{height:80}} />
+                   </div>
+                 )}
              </div>
 
              <div className={step !== 3 ? 'hidden' : ''}>
-                 <div style={{display:'flex', gap:20, margin:'10px 0'}}><label><input type="checkbox" checked={chkErede} onChange={e=>handleChkEredeChange(e.target.checked)} /> Altri eredi</label><label><input type="checkbox" checked={chkUnicoErede} onChange={e=>handleChkUnicoEredeChange(e.target.checked)} /> Unico erede</label></div>
-                 {eredi.map(erede => (
-                    <div key={erede.id} className="erede-section animate-in">
-                        <div style={{display:'flex', gap:8}}>
-                            <select value={erede.parentela} onChange={e=>handleEredeChange(erede.id,'parentela',e.target.value)}>
-                                <option value="">Grado...</option>
-                                {GRADI_PARENTELA.map(g => <option key={g} value={g}>{g}</option>)}
-                            </select>
-                            <input type="text" value={erede.nome} onChange={e=>handleEredeChange(erede.id,'nome',e.target.value)} placeholder="Nome" />
-                        </div>
-                        <label style={{fontSize:'0.8em', marginTop:10}}>Documenti Erede (Multipli supportati):</label>
-                        <input type="file" multiple onChange={e=>handleEredeFiles(erede.id, e)} />
-                    </div>
-                 ))}
-                 {chkErede && <button className="btn-add" onClick={()=>aggiungiErede()}>+ Aggiungi Erede</button>}
+                 {(tipoPratica === 'Successione' || tipoPratica === 'Voltura' || tipoPratica === 'Altro') ? (
+                   <div className="animate-in slide-in-from-bottom-2">
+                       <div style={{display:'flex', gap:20, margin:'10px 0'}}><label><input type="checkbox" checked={chkErede} onChange={e=>handleChkEredeChange(e.target.checked)} /> Altri eredi</label><label><input type="checkbox" checked={chkUnicoErede} onChange={e=>handleChkUnicoEredeChange(e.target.checked)} /> Unico erede</label></div>
+                       {eredi.map(erede => (
+                           <div key={erede.id} className="erede-section animate-in">
+                               <div style={{display:'flex', gap:8}}>
+                                   <select value={erede.parentela} onChange={e=>handleEredeChange(erede.id,'parentela',e.target.value)}>
+                                       <option value="">Grado...</option>
+                                       {GRADI_PARENTELA.map(g => <option key={g} value={g}>{g}</option>)}
+                                   </select>
+                                   <input type="text" value={erede.nome} onChange={e=>handleEredeChange(erede.id,'nome',e.target.value)} placeholder="Nome" />
+                               </div>
+                               <label style={{fontSize:'0.8em', marginTop:10}}>Documenti Erede (Multipli supportati):</label>
+                               <input type="file" multiple onChange={e=>handleEredeFiles(erede.id, e)} />
+                           </div>
+                       ))}
+                       {chkErede && <button className="btn-add" onClick={()=>aggiungiErede()}>+ Aggiungi Erede</button>}
+                   </div>
+                 ) : tipoPratica === 'Curriculum Vitae' ? (
+                   <div className="animate-in slide-in-from-bottom-2">
+                       <label>Competenze e Lingue:</label>
+                       <textarea value={competenze} onChange={e=>setCompetenze(e.target.value)} placeholder="Competenze Tecniche, Lingue, Soft Skills..." style={{height:150}} />
+                   </div>
+                 ) : (
+                   <div className="animate-in slide-in-from-bottom-2" style={{textAlign:'center', padding:40, color:'#666'}}>
+                       <p>Nessun dato aggiuntivo richiesto per questo step.</p>
+                       <p>Clicca "Avanti" per procedere al caricamento documenti.</p>
+                   </div>
+                 )}
              </div>
 
              <div className={step !== 4 ? 'hidden' : ''}>
                  <div style={{background:'#eef', padding:15, borderRadius:8, border:'1px dashed #2b3a67', marginBottom:15}}>
-                    <label>📂 Fascicolo Unico (Supporta più file selezionati)</label>
+                    <label>📂 {tipoPratica === 'Curriculum Vitae' ? 'Certificazioni e Allegati' : 'Fascicolo Unico (Supporta più file selezionati)'}</label>
                     <input type="file" multiple onChange={e=>handleFileChange('docCompleto', e)} />
                  </div>
                  <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:10}}>
-                    {['docIdentita','cfDecuius','certificato','docIban','docIdDichiarante','cfDichiarante'].map(k => (
-                        <div key={k}><label style={{fontSize:'0.8em'}}>{k.toUpperCase()} (Multipli)</label><input type="file" multiple onChange={(e)=>handleFileChange(k, e)} /></div>
-                    ))}
+                    {(tipoPratica === 'Successione' || tipoPratica === 'Voltura' || tipoPratica === 'Altro') && (
+                       <>
+                           {['docIdentita','cfDecuius','certificato','docIban','docIdDichiarante','cfDichiarante'].map(k => (
+                               <div key={k}><label style={{fontSize:'0.8em'}}>{k.toUpperCase()} (Multipli)</label><input type="file" multiple onChange={(e)=>handleFileChange(k, e)} /></div>
+                           ))}
+                       </>
+                    )}
+
+                    {(tipoPratica === 'Locazione' || tipoPratica === 'Comodato d\'uso') && (
+                       <>
+                           <div><label style={{fontSize:'0.8em'}}>ID/CF LOCATORE (Multipli)</label><input type="file" multiple onChange={(e)=>handleFileChange('docIdentita', e)} /></div>
+                           <div><label style={{fontSize:'0.8em'}}>ID/CF CONDUTTORE (Multipli)</label><input type="file" multiple onChange={(e)=>handleFileChange('docIdDichiarante', e)} /></div>
+                           <div><label style={{fontSize:'0.8em'}}>VISURA CATASTALE (Multipli)</label><input type="file" multiple onChange={(e)=>handleFileChange('certificato', e)} /></div>
+                           {tipoPratica === 'Locazione' && <div><label style={{fontSize:'0.8em'}}>APE (Multipli)</label><input type="file" multiple onChange={(e)=>handleFileChange('cfDecuius', e)} /></div>}
+                       </>
+                    )}
+
+                    {tipoPratica === 'Curriculum Vitae' && (
+                       <>
+                           <div><label style={{fontSize:'0.8em'}}>FOTO PROFILO</label><input type="file" onChange={(e)=>handleFileChange('docIdentita', e)} /></div>
+                           <div><label style={{fontSize:'0.8em'}}>BOZZA CV ESISTENTE</label><input type="file" onChange={(e)=>handleFileChange('certificato', e)} /></div>
+                       </>
+                    )}
                  </div>
              </div>
 
