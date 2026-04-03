@@ -7,9 +7,9 @@ import './index.css';
 // --- CONFIGURAZIONE CLOUD RUN / DRIVE API ---
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "459844148501-q51mjbjk1kqj4ku90c7tooh51lcgbs3f.apps.googleusercontent.com"; 
 const GOOGLE_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY || "AIzaSyCI-zsRP85UVOi0DjtiCwWBwQ1djDy741g"; 
-const ROOT_FOLDER_ID = import.meta.env.VITE_ROOT_FOLDER_ID || "1eBkIqLgxVNbggd3tLK1t_5KWkmvOPNIl"; 
+const ROOT_FOLDER_ID = import.meta.env.VITE_ROOT_FOLDER_ID || "1VqJQs8xhBD4QuJn4u-5v7mbsSd3pRKxP"; 
 let SENT_FOLDER_ID = import.meta.env.VITE_SENT_FOLDER_ID || "16_ie96ihd4lJouI8BcrqjjfQS_Rq7Ep0"; 
-const DB_FOLDER_ID = import.meta.env.VITE_DB_FOLDER_ID || "1eBkIqLgxVNbggd3tLK1t_5KWkmvOPNIl"; 
+const DB_FOLDER_ID = import.meta.env.VITE_DB_FOLDER_ID || "1VqJQs8xhBD4QuJn4u-5v7mbsSd3pRKxP"; 
 const DB_FILE_NAME = "successio_master_db.json";
 
 const GRADI_PARENTELA = [

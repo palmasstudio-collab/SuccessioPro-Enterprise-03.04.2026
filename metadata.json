@@ -1,0 +1,5 @@
+{
+  "name": "SuccessioPro Enterprise",
+  "description": "Piattaforma avanzata per la gestione delle pratiche di successione, volture e consulenze tecniche con integrazione Google Drive.",
+  "requestFramePermissions": ["geolocation"]
+}
